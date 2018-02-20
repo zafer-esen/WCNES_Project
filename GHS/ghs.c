@@ -1,4 +1,11 @@
 /*
+ * TODO: implement sendNotifMerge(rimeaddr_t* addr);
+ * TODO: add handler for sendNotifyMerge reception to unicast
+ * TODO: implement sendMergeRequest() which will be called from the above TODO
+ * TODO: add handler for sendMergeRequest reception to unicast
+ */
+
+/*
  * Copyright (c) 2010, Swedish Institute of Computer Science.
  * All rights reserved.
  *
@@ -8,7 +15,7 @@
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
+ *    notice,` this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
  * 3. Neither the name of the Institute nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
@@ -94,6 +101,9 @@ Original GHS algorithm (not implemented for now)
      Branch and Rejected are stable attributes (they do not change again)
  */
 
+/* event posted when child responds to mwoe query */ 
+process_event_t mwoe_received;
+
 uint8_t state = 0;
 uint8_t id; //fragment id
 uint8_t numEdges;
@@ -101,9 +111,13 @@ int8_t level = 0;
 int8_t bestEdge = -1;
 int8_t bestWeight = INF_WEIGHT; 
 int8_t testEdge = -1;
-int8_t parent = -1;
+int8_t hasParent = 0; //initially no parent
+rimeaddr_t parent; //address of the parent
 uint8_t root;
 uint8_t awaiting_children = 0;
+rimeaddr_t mwoe_owner; //our child who is connected to the mwoe, if any
+//if NULL, we do not have any children
+neighbor reported_mwoe; //this will hold the info about the reported mwoe
 
 /* This MEMB() definition defines a memory pool from which we allocate
    neighbor entries. */
@@ -111,8 +125,6 @@ MEMB(neighbors_memb, neighbor, MAX_NEIGHBORS);
 
 /* The neighbors_list holds the one-hop neighbors. */
 LIST(neighbors_list);
-/* The fragment neighbors_list holds the neighbors returned by children (contains at most num_children elements) */
-LIST(children_neighbors_list); 
 
 /* These hold the broadcast and unicast structures, respectively. */
 static struct broadcast_conn broadcast;
@@ -156,7 +168,7 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
     break;
   
   case BCAST_TYPE_FIND_MWOE:
-    if(parent == m->id){ //we only care if the bcast sender is our parent
+    if(has_parent && (rimeaddr_cmp(&parent,from))){ //we only care if we have a parent and the sender is our parent
       if(hasChildren()){ //we only bcast if we have children
 	awaiting_children = num_children; //we should wait for all our children to reply before we return our own MWOE result
 	msg.bcast_type = BCAST_TYPE_FIND_MWOE;
@@ -172,7 +184,6 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 /* This is where we define what function to be called when a broadcast
    is received. We pass a pointer to this structure in the
    broadcast_open() call below. */
-process_event_t mwoe_received;
 static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
 /*---------------------------------------------------------------------------*/
 /* This function is called for every incoming unicast packet. */
@@ -186,12 +197,13 @@ recv_uc(struct unicast_conn *c, const rimeaddr_t *from)
 
   switch(msg->type){
   case UNICAST_TYPE_MWOE_RESULT:
-    n = addToList(&children_neighbors_list, &(msg->mwoe_addr));
-    n->id = msg->mwoe_id;
-    n->weight = msg->mwoe_weight;
+    if(msg->mwoe_weight < reported_mwoe.weight){ //if we have a new minimum (we should break ties by adding the id value here)
+      rimeaddr_copy (&mwoe_owner, from); //change the owner of the mwoe
+      reported_mwoe.weight = msg->mwoe_weight; //update the reported mwoe weight to reflect the received value
+      rimeaddr_copy (&(reported_mwoe.addr), (msg->mwoe_addr)); //update the reported mwoe address
+      reported_mwoe.id = msg->mwoe_id;    
+    }
     process_post(broadcast_process, mwoe_received, 0); //we report to the main so that they know we received word from a child
-    // packetbuf_copyfrom(msg, sizeof(struct unicast_message));
-    // unicast_send(c, from);
   }
 }
 static const struct unicast_callbacks unicast_callbacks = {recv_uc};
@@ -202,12 +214,14 @@ PROCESS_THREAD(broadcast_process, ev, data)
   static struct broadcast_message msg;
   static neighbor* min_n = NULL;
 
-  PROCESS_EXITHANDLER(broadcast_close(&broadcast);)
+  PROCESS_EXITHANDLER(broadcast_close(&broadcast); unicast_close(&unicast);)
   PROCESS_BEGIN();
 
   broadcast_open(&broadcast, 129, &broadcast_call);
+  unicast_open(&unicast, 146, &unicast_callbacks);
 
   root = rimeaddr_node_addr.u8[0]; //initially each node is th root of its own fragment, so assign own id
+
   while(outgoing edges){
     // 1. get all neighbour's weights and their fragment IDs (broadcast)
     msg.bcast_type = BCAST_TYPE_NEIGHBORS;
@@ -220,6 +234,8 @@ PROCESS_THREAD(broadcast_process, ev, data)
 
     // 2. The root uses flooding/echo to determine the MWOE of the fragment (u,v).
       //send to all children FIND message, the children should return back their MWOE flood/echo
+    reported_mwoe.weight = INF_WEIGHT; //initialize this to inf so any reported MWOE will be saved
+    min_n = findMinEdge(); //first find the minimum among our 1-hop neighbors
     if ( isRoot() ){
       if ( hasChildren() ){  //if we are the root and if we have children, we need to send the initial message
 	msg.bcast_type = BCAST_TYPE_FIND_MWOE;
@@ -232,9 +248,8 @@ PROCESS_THREAD(broadcast_process, ev, data)
 	  PROCESS_WAIT_EVENT(mwoe_received);
 	  awaiting_children--;
 	}
-      }else{ //if we are the root and if we do not have children, we only care about our own 1-hop neighbors
-	min_n = findMinEdge();
-	clearList(&children_neighbors_list); //we do not need to keep our children's mwoe after this point
+	if( reported_mwoe.weight  <  min_n->weight ) //if the child reported a smaller weight than our own
+	  min_n = &reported_mwoe; //use the reported one
       }
     }
     else{ //if we are not the root, we wait until we hear back from all our children then send our mwoe to our parent
@@ -243,60 +258,37 @@ PROCESS_THREAD(broadcast_process, ev, data)
 	  PROCESS_WAIT_EVENT(mwoe_received);
 	  awaiting_children--;
 	}
+	if( reported_mwoe.weight  <  min_n->weight ) //if the child reported a smaller weight than our own
+	  min_n = &reported_mwoe; //use the reported one
       }
-      sendToParent(findMinEdge());
-      clearList(&children_neighbors_list); //we do not need to keep our children's mwoe after this point
+      sendToParent(min_n);
     }
 
-    // 3. The root sends a message to node u,while forwarding the message all parent-child relations
+    // 3. The root sends a message to node u(the node who found the mwoe),while forwarding the message all parent-child relations
     //    are inverted, such that u is the new temporary root of the fragment. (unicast)
-    if ( isRoot()){
-      // ... 
+    if ( isRoot() ){
+      if ( hasChildren()){
+	if( rimeaddr_cmp(&(min_n->addr), &(reported_mwoe.addr))  ){ //if mwoe is reported by a child
+	  root = -1; //we are not the root anymore
+	  rimeaddr_copy (&parent, &mwoe_owner.addr); //invert parent-child relationship
+	  sendNotifyMerge(&mwoe_owner); //notify the child (or the new parent)
+	}
+	else{ //if we have children but the mwoe reported is one of our own neighbors
+	  sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
+	}
+      }
+      else{ //if we do not have any children
+	sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
+      }
     }
-
-    // 4. node u sends merge request to node v. (unicast)
-
-    // 5. new node uses flooding/echo to inform the nodes about the new id 
+    // 4. node u sends merge request to node v. (if not root, this is handled in the unicast handler)
+    // 5. newly elected node uses flooding/echo to inform the nodes about the new id 
+    // ...
   }
   
   PROCESS_END();
 }
-/*---------------------------------------------------------------------------*/
-PROCESS_THREAD(unicast_process, ev, data)
-{
-  PROCESS_EXITHANDLER(unicast_close(&unicast);)
-    
-  PROCESS_BEGIN();
 
-  unicast_open(&unicast, 146, &unicast_callbacks);
-
-  while(1) {
-    static struct etimer et;
-    struct unicast_message msg;
-    struct neighbor *n;
-    int randneighbor, i;
-    
-    etimer_set(&et, CLOCK_SECOND * 8 + random_rand() % (CLOCK_SECOND * 8));
-    
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-
-    /* Pick a random neighbor from our list and send a unicast message to it. */
-    if(list_length(neighbors_list) > 0) {
-      randneighbor = random_rand() % list_length(neighbors_list);
-      n = list_head(neighbors_list);
-      for(i = 0; i < randneighbor; i++) {
-        n = list_item_next(n);
-      }
-      printf("sending unicast to %d.%d\n", n->addr.u8[0], n->addr.u8[1]);
-
-      msg.type = UNICAST_TYPE_PING;
-      packetbuf_copyfrom(&msg, sizeof(msg));
-      unicast_send(&unicast, &n->addr);
-    }
-  }
-
-  PROCESS_END();
-}
 
 static neighbor* findMinEdge() //find the min edge inside fragment (including this node and children if any)
 {
@@ -304,11 +296,6 @@ static neighbor* findMinEdge() //find the min edge inside fragment (including th
   int8_t minWeight = INF_WEIGHT;
   //iterate through all neighbours (and those of our children) and find the minimum weight edge  
   for(n = list_head(neighbors_list); n != NULL; n = list_item_next(n))
-    if(n->weight < minWeight){
-      min_n = n;
-      minWeight = n->weight;
-    }
-  for(n = list_head(children_neighbors_list); n != NULL; n = list_item_next(n))
     if(n->weight < minWeight){
       min_n = n;
       minWeight = n->weight;

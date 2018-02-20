@@ -26,7 +26,9 @@ enum{
 
 /* UCAST message types */
 enum {
-  UNICAST_TYPE_MWOE_RESULT
+  UNICAST_TYPE_MWOE_RESULT,
+  UNICAST_TYPE_NOTIFY_MERGE,
+  UNICAST_TYPE_MERGE_REQUEST
 };
 /*-------------------------------------------------*/
 
