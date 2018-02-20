@@ -1,6 +1,5 @@
 /*
- * TODO: implement sendNotifMerge(rimeaddr_t* addr);
- * TODO: add handler for sendNotifyMerge reception to unicast
+ * TODO: add handler for UNICAST_TYPE_NOTIFY_MERGE under unicast
  * TODO: implement sendMergeRequest() which will be called from the above TODO
  * TODO: add handler for sendMergeRequest reception to unicast
  */
@@ -204,6 +203,12 @@ recv_uc(struct unicast_conn *c, const rimeaddr_t *from)
       reported_mwoe.id = msg->mwoe_id;    
     }
     process_post(broadcast_process, mwoe_received, 0); //we report to the main so that they know we received word from a child
+    break;
+  case UNICAST_TYPE_NOTIFY_MERGE:
+    //check if the mwoe is ours
+    //if ours send merge request
+    //if not ours send message to mwoe_owner
+    break;
   }
 }
 static const struct unicast_callbacks unicast_callbacks = {recv_uc};
@@ -261,7 +266,7 @@ PROCESS_THREAD(broadcast_process, ev, data)
 	if( reported_mwoe.weight  <  min_n->weight ) //if the child reported a smaller weight than our own
 	  min_n = &reported_mwoe; //use the reported one
       }
-      sendToParent(min_n);
+      sendToParent(min_n, UNICAST_TYPE_MWOE_RESULT);
     }
 
     // 3. The root sends a message to node u(the node who found the mwoe),while forwarding the message all parent-child relations
@@ -270,8 +275,8 @@ PROCESS_THREAD(broadcast_process, ev, data)
       if ( hasChildren()){
 	if( rimeaddr_cmp(&(min_n->addr), &(reported_mwoe.addr))  ){ //if mwoe is reported by a child
 	  root = -1; //we are not the root anymore
-	  rimeaddr_copy (&parent, &mwoe_owner.addr); //invert parent-child relationship
-	  sendNotifyMerge(&mwoe_owner); //notify the child (or the new parent)
+	  rimeaddr_copy (&parent, &mwoe_owner); //invert parent-child relationship
+	  sendToParent(min_n, UNICAST_TYPE_NOTIFY_MERGE); //notify the child (or the new parent)
 	}
 	else{ //if we have children but the mwoe reported is one of our own neighbors
 	  sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
@@ -346,18 +351,14 @@ static void clearList(list_t* l)
 }
 
 //send mwoe result to our parent
-static void sendToParent(const node* n)
+static void sendToParent(const node* n, uint8_t type)
 {
   struct unicast_message msg;
-  rimeaddr_t addr;   
-  if(parent < 0) return; //do this only if we have a parent
-  addr.u8[0] = parent; //make sure RIMEADDR_SIZE is 2!!
-  addr.u8[1] = 0;
-  msg.type = UNICAST_TYPE_MWOE_RESULT;
+  msg.type = type;
   msg.mwoe_addr = n->addr;
   msg.mwoe_id = n->id;
   msg.mwoe_weight = n->weight;
   packetbuf_copyfrom(&msg, sizeof(msg));
-  unicast_send(&unicast, &addr);
+  unicast_send(&unicast, &parent);
 }
 /*---------------------------------------------------------------------------*/

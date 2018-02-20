@@ -39,7 +39,7 @@ inline uint8_t hasChildren(){return num_children > 0;}
 static neighbor* findMinEdge();
 static neighbor* addToList(list_t* l, const rime_addr_t* addr);
 static void clearList(list_t* l); 
-static void sendToParent(const node* n);
+static void sendToParent(const node* n, uint8_t type);
 /*-------------------------------------------------*/
 
 /*-------------------------------------------------*/
