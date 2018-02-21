@@ -8,10 +8,11 @@ struct broadcast_message {
   uint8_t type;
   uint8_t id; //fragment id
   int8_t level; //fragment level
+  rimeaddr_t last_mwoe_addr; //the address of the last added mwoe, this is sent so everyone knows the newcomer
 };
 
 /* This is the structure of unicast messages. */
-struct unicast_message {
+struct runicast_message {
   uint8_t type;
   rimeaddr_t mwoe_addr; //node addr
   uint8_t mwoe_id; //fragment id
@@ -53,7 +54,8 @@ typedef struct neighbor {
 
 /*-------------------------------------------------*/
 /* OTHER DEFINITIONS */
-#define INF_WEIGHT 127 //int8_t max, rssi values are in the negative, so this can be seen as inf
+#define INF_WEIGHT -128 //int8_t min
+#define MAX_RETRANSMISSIONS 255//number of retransmissions for reliable unicast
 /*-------------------------------------------------*/
 
 #endif

@@ -117,22 +117,27 @@ uint8_t awaiting_children = 0;
 rimeaddr_t mwoe_owner; //our child who is connected to the mwoe, if any
 //if NULL, we do not have any children
 neighbor reported_mwoe; //this will hold the info about the reported mwoe
+neighbor not_found;
 static neighbor* min_n = NULL;
 uint8_t root;
 uint8_t num_children;
 uint8_t mwoeIsReceived = 0;
+uint8_t mwoeIsRequested = 0;
+rimeaddr_t last_added_mwoe_addr;
 /*-------------------------------------------------*/
 /* FUNCTION DECLARATIONS */
 static neighbor* findMinEdge();
 static neighbor* addNeighbor(const rimeaddr_t* addr);
 static neighbor* addChild(const rimeaddr_t* addr);
-static void clearList(list_t* l); 
+//static void clearList(list_t* l); 
 static void sendToParent(const neighbor* n, uint8_t type);
 static void addChildMWOE();
 static void sendMergeRequest(const rimeaddr_t* addr);
 static void sendMergeNotify(const rimeaddr_t* addr);
 inline uint8_t isRoot(){return root == rimeaddr_node_addr.u8[0];}
 inline uint8_t hasChildren(){return num_children > 0;}
+static void removeNeighbor(const rimeaddr_t * addr);
+
 /*-------------------------------------------------*/
 
 /* This MEMB() definition defines a memory pool from which we allocate
@@ -145,12 +150,12 @@ LIST(children_list);
 
 /* These hold the broadcast and unicast structures, respectively. */
 static struct broadcast_conn broadcast;
-static struct unicast_conn unicast;
+static struct runicast_conn runicast;
 
 /*---------------------------------------------------------------------------*/
 PROCESS(broadcast_process, "Broadcast process");
 
-//AUTOSTART_PROCESSES(&broadcast_process, &unicast_process);
+//AUTOSTART_PROCESSES(&broadcast_process, &runicast_process);
 AUTOSTART_PROCESSES(&broadcast_process);
 /*---------------------------------------------------------------------------*/
 
@@ -168,7 +173,6 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
   case BCAST_TYPE_NEIGHBORS:
     /* Check if we already know this neighbor. */
     n = addNeighbor(from);
-    printf("bcast received, added neighbor ID:%d to neighbors list\n",from->u8[0]);
     /* If n is NULL, this neighbor was found in our list, but we update its fields anyway*/
     //if(n != NULL){}
     n->weight = packetbuf_attr(PACKETBUF_ATTR_RSSI);
@@ -176,16 +180,18 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
     n->level = m->level;
 
     /* Print out a message. */
-    printf("bcast neighbors message received from %d, RSSI %d, fragment id %d and fragment level %d\n",
+    /*printf("bcast neighbors message received from %d, RSSI %d, fragment id %d and fragment level %d\n",
 	   from->u8[0],
 	   packetbuf_attr(PACKETBUF_ATTR_RSSI),
 	   n->id,
-	   n->level);
+	   n->level);*/
     break;
   
   case BCAST_TYPE_FIND_MWOE:
-    printf("received bcast_type_find_mwoe\n");
     if(hasParent && (rimeaddr_cmp(&parent,from))){ //we only care if we have a parent and the sender is our parent
+      printf("mwoe requested from parent...\n");            
+      mwoeIsRequested = 1;      
+      rimeaddr_copy(&last_added_mwoe_addr, &msg.last_mwoe_addr);
       if(hasChildren()){ //we only bcast if we have children
 	awaiting_children = num_children; //we should wait for all our children to reply before we return our own MWOE result
 	msg.type = BCAST_TYPE_FIND_MWOE;
@@ -194,6 +200,7 @@ broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from)
 	packetbuf_copyfrom(&msg, sizeof(struct broadcast_message));
 	broadcast_send(&broadcast);
       }
+      process_post(&broadcast_process, 0, 0); 
     }  
     break;
   }
@@ -205,24 +212,25 @@ static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
 /*---------------------------------------------------------------------------*/
 /* This function is called for every incoming unicast packet. */
 static void
-recv_uc(struct unicast_conn *c, const rimeaddr_t *from)
+recv_uc(struct runicast_conn *c, const rimeaddr_t *from, uint8_t seqno)
 {
-  struct unicast_message *msg;
+  struct runicast_message *msg;
   /* Grab the pointer to the incoming data. */ 
- msg = packetbuf_dataptr();
+
+  printf("runicast received\n");
+  msg = packetbuf_dataptr();
 
   switch(msg->type){
   case UNICAST_TYPE_MWOE_RESULT:
-      printf("mwoe result requested from ID:%d\n",from->u8[0]);
-    if(msg->mwoe_weight < reported_mwoe.weight){ //if we have a new minimum (we should break ties by adding the id value here)
+    if(msg->mwoe_weight > reported_mwoe.weight){ //if we have a new minimum (we should break ties by adding the id value here)
       rimeaddr_copy (&mwoe_owner, from); //change the owner of the mwoe
       reported_mwoe.weight = msg->mwoe_weight; //update the reported mwoe weight to reflect the received value
       rimeaddr_copy (&(reported_mwoe.addr), &(msg->mwoe_addr)); //update the reported mwoe address
       reported_mwoe.id = msg->mwoe_id;    
     }
     mwoeIsReceived = 1;
-    printf("We have received MWOE from child ID:%d with RSSI: %d\n",
-	   from->u8[0],reported_mwoe.id,reported_mwoe.weight);
+    printf("We have received MWOE from child %d with ID:%d and RSSI: %d\n",
+	   from->u8[0], reported_mwoe.addr.u8[0],reported_mwoe.weight);
     process_post(&broadcast_process, mwoe_received, 0); //we report to the main so that they know we received word from a child
     break;
   case UNICAST_TYPE_NOTIFY_MERGE:
@@ -230,34 +238,58 @@ recv_uc(struct unicast_conn *c, const rimeaddr_t *from)
       if( rimeaddr_cmp(&(msg->mwoe_addr), &(reported_mwoe.addr))  ){ //if mwoe owner is a child
 	printf("ID:%d is not one of our children, forwarding to ID:%d\n",msg->mwoe_addr.u8[0],mwoe_owner.u8[0]);
 	sendMergeNotify(&(mwoe_owner)); //notify the child
+	removeNeighbor(&reported_mwoe.addr); //remove this neighbor if we also have a connection
       }
       else{ //the mwoe reported is one of our own neighbors
-	sendMergeRequest(&(min_n->addr)); //4. send the merge request to our own mwoe	
-	addChildMWOE(); //move our neighbour mwoe to be our child
+	if(min_n != &not_found){
+	  sendMergeRequest(&(min_n->addr)); //4. send the merge request to our own mwoe	
+	  addChildMWOE(); //move our neighbour mwoe to be our child
+	  min_n = &not_found; //clear min_n
+	}
       }
     break;
   case UNICAST_TYPE_MERGE_REQUEST: //if we are an unconnected node and receive this message, we should set out parent to be the sender
     printf("Merge requested, ID:%d is our new parent\n",from->u8[0]);
     hasParent = 1; //now we have a parent
     rimeaddr_copy (&parent, from); //change our parent to be the message sender
-    //print out information or send back ack
+    removeNeighbor(&parent); //remove parent from neighbors list
+    process_post(&broadcast_process, 0, 0);
+        //send back ack?
     break;
   }
 }
-static const struct unicast_callbacks unicast_callbacks = {recv_uc};
+
+static void
+sent_runicast(struct runicast_conn *c, const rimeaddr_t *to, uint8_t retransmissions)
+{
+  /*  printf("runicast message sent to %d.%d, retransmissions %d\n",
+      to->u8[0], to->u8[1], retransmissions);*/
+}
+static void
+timedout_runicast(struct runicast_conn *c, const rimeaddr_t *to, uint8_t retransmissions)
+{
+  printf("runicast message timed out when sending to %d.%d, retransmissions %d\n",
+    to->u8[0], to->u8[1], retransmissions);
+}
+static const struct runicast_callbacks runicast_callbacks = {recv_uc, sent_runicast, timedout_runicast};
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(broadcast_process, ev, data)
 {
   static struct etimer et;
   static struct broadcast_message msg;
   static uint8_t count = 0;
-  PROCESS_EXITHANDLER(broadcast_close(&broadcast); unicast_close(&unicast);)
+  PROCESS_EXITHANDLER(broadcast_close(&broadcast); runicast_close(&runicast);)
     PROCESS_BEGIN();
 
   broadcast_open(&broadcast, 129, &broadcast_call);
-  unicast_open(&unicast, 146, &unicast_callbacks);
+  runicast_open(&runicast, 146, &runicast_callbacks);
 
+  id = rimeaddr_node_addr.u8[0];
   root = 1; //root is the one with the 0 id, in this simplified centralized version
+
+  not_found.id = -1;
+  not_found.weight = -128;
+
   //rimeaddr_node_addr.u8[0]; //initially each node is th root of its own fragment, so assign own id
   if(isRoot())
     printf("This node is the root!\n");
@@ -268,15 +300,16 @@ PROCESS_THREAD(broadcast_process, ev, data)
   packetbuf_copyfrom(&msg, sizeof(struct broadcast_message));
   printf("sending bcast_type_neighbors message...\n");
 
-  while(count<5){ //if we do not have any neighbors, keep sending a message every few secs
+  while(count<3){ //if we do not have any neighbors, keep sending a message every few secs
     count++;
     broadcast_send(&broadcast); 
-    etimer_set(&et,CLOCK_SECOND*5 ); //wait for enough time to collect the neighbours
+    etimer_set(&et,CLOCK_SECOND*2 ); //wait for enough time to collect the neighbours
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
   }
-  etimer_set(&et, CLOCK_SECOND * 20 ); //wait for enough time to collect the neighbours
-  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-
+  //  etimer_set(&et, CLOCK_SECOND *  ); //wait for enough time to collect the neighbours
+  //PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+  if(isRoot())    
+    printf("Neighbors found, moving on to find the min edges...\n");
   while(1){ //TODO: for now we do not check if the neighbors are empty, we should stop at some point
     // 1. get all neighbour's weights and their fragment IDs (broadcast)
     
@@ -284,15 +317,15 @@ PROCESS_THREAD(broadcast_process, ev, data)
     //send to all children FIND message, the children should return back their MWOE flood/echo
     etimer_set(&et, CLOCK_SECOND * 4 ); //wait for enough time to collect the neighbours
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));   
-    printf("Neighbors found, moving on to find the min edges...\n");
     reported_mwoe.weight = INF_WEIGHT; //initialize this to inf so any reported MWOE will be saved
-    min_n = findMinEdge(); //first find the minimum among our 1-hop neighbors
     if ( isRoot() ){
+      min_n = findMinEdge(); //find the minimum among our 1-hop neighbors	      
       if ( hasChildren() ){  //if we are the root and if we have children, we need to send the initial message
-	printf("this is the root and we have children, sending find mwoe to children...\n");
+	printf("sending find mwoe to children...\n");
 	msg.type = BCAST_TYPE_FIND_MWOE;
 	msg.level = level;
 	msg.id = rimeaddr_node_addr.u8[0];
+	rimeaddr_copy (&msg.last_mwoe_addr, &last_added_mwoe_addr);
 	packetbuf_copyfrom(&msg, sizeof(struct broadcast_message));
 	broadcast_send(&broadcast);
 	awaiting_children = num_children;
@@ -303,16 +336,31 @@ PROCESS_THREAD(broadcast_process, ev, data)
 	  mwoeIsReceived = 0;
 	}
 	printf("heard back from children!!\n");
-	if( reported_mwoe.weight  <  min_n->weight ) //if the child reported a smaller weight than our own
+	
+	if((reported_mwoe.addr.u8[0] != id) && //if the reported mwoe is not us
+	   (reported_mwoe.weight  >  min_n->weight) ) //if the child reported a smaller weight than our own
 	  min_n = &reported_mwoe; //use the reported one
+	
+	if(min_n == &not_found){
+	  printf("MST formed!\n");
+	  break;
+	}
       }
       else{
 	printf("root does not have children, so we will use own mwoe...\n");
       }
     }
-    else if(hasParent){ //if we are not the root, but connected to the fragment 
-      etimer_set(&et, CLOCK_SECOND * 20 ); //wait for enough time to hear from the root
-      PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+    else if (!hasParent){ //wait until we have a parent, since we are not the root
+      printf("waiting until we have a parent\n");
+      PROCESS_WAIT_EVENT_UNTIL(hasParent);
+    }
+    if(hasParent){
+      printf("waiting until mwoe is requested\n");
+      PROCESS_WAIT_EVENT_UNTIL(mwoeIsRequested); //wait until the root requests the mwoe
+      mwoeIsRequested = 0;
+      //remove any previously added mwoe if that exists in our neighbours list
+      removeNeighbor(&last_added_mwoe_addr);
+      min_n = findMinEdge(); //find the minimum among our 1-hop neighbors
       if( hasChildren() ){
 	printf("we are a child and we have children, so we wait for them...\n");
 	while(awaiting_children > 0){
@@ -320,40 +368,47 @@ PROCESS_THREAD(broadcast_process, ev, data)
 	  awaiting_children--;
 	  mwoeIsReceived = 0;
 	}
-	if( reported_mwoe.weight  <  min_n->weight ) //if the child reported a smaller weight than our own
+	if( reported_mwoe.weight  >  min_n->weight ) //if the child reported a smaller weight than our own
 	  min_n = &reported_mwoe; //use the reported one
-	printf("sending our mwoe to parent with ID:%d and RSSI:%d\n",min_n->addr.u8[0],min_n->weight);
-	sendToParent(min_n, UNICAST_TYPE_MWOE_RESULT);
+      }
+      printf("sending our mwoe to parent with ID:%d and RSSI:%d\n",min_n->addr.u8[0],min_n->weight);
+      sendToParent(min_n, UNICAST_TYPE_MWOE_RESULT);
+    }
+    else if(!isRoot()){
+      if(min_n){
+	printf("we are a child with no children, send back own MWOE ID:%d with RSSI: %d...\n",
+		 min_n->addr.u8[0],min_n->weight);
+	  sendToParent(min_n, UNICAST_TYPE_MWOE_RESULT);
       }
       else{
-	printf("we are a child with no children, send back own MWOE ID:%d with RSSI: %d...\n",
-	       min_n->addr.u8[0],min_n->weight);
+	printf("we do not have any children left, sending to parent null value\n");
 	sendToParent(min_n, UNICAST_TYPE_MWOE_RESULT);
       }
-    }
-    else{
-      printf("This node is not connected to the fragment yet, just waiting a bit\n");
-      etimer_set(&et, CLOCK_SECOND * 20 ); //wait for enough time to hear from the root
-      PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
     }
 
     // 3. The root sends a message to node u(the node who found the mwoe),while forwarding the message all parent-child relations
     //    are inverted, such that u is the new temporary root of the fragment. (unicast)
     if ( isRoot() ){
       if ( hasChildren()){
-	if( rimeaddr_cmp(&(min_n->addr), &(reported_mwoe.addr))  ){ //if mwoe is reported by a child
-	  printf("sending mergenotify to child\n");
+	if( min_n == &reported_mwoe ){  //if mwoe is reported by a child
+	  //(maybe we have a connection to mwoe too)
 	  sendMergeNotify(&(min_n->addr)); //notify the child (or the new parent)
+	  removeNeighbor(&(min_n->addr));
 	}
 	else{ //if we have children but the mwoe reported is one of our own neighbors
-	  addChildMWOE(); //add the mwoe as our own child
-	  sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
-	  min_n = NULL; //clear min_n
+	  if(min_n != &not_found){
+	    addChildMWOE(); //add the mwoe as our own child
+	    sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
+	    min_n = &not_found; //clear min_n
+	  }
 	}
       }
       else{ //if we do not have any children
-	addChildMWOE();//add the mwoe as our own child
-	sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
+	if(min_n != &not_found){
+	  addChildMWOE();//add the mwoe as our own child
+	  sendMergeRequest(&(min_n->addr)); //4. directly send the merge request to our own connected mwoe
+	  min_n = &not_found; //clear min_n
+	}
       }
     }
   }
@@ -368,14 +423,16 @@ static neighbor* findMinEdge() //find the min edge inside fragment (including th
   int8_t minWeight = INF_WEIGHT;
   //iterate through all neighbours (and those of our children) and find the minimum weight edge  
   for(n = list_head(neighbors_list); n != NULL; n = list_item_next(n))
-    if(n->weight < minWeight){
+    if(n->weight > minWeight){
       min_n = n;
       minWeight = n->weight;
     }
-  if(min_n && min_n->addr.u8[0])
+  /*if(min_n && min_n->addr.u8[0])
     printf("MWOE ID:%d with RSSI: %d\n", min_n->addr.u8[0],minWeight);
   else
-    printf("no neighbors left, will ask children for MWOE\n");
+  printf("no neighbors left, will ask children for MWOE\n");*/
+  if(!min_n)
+    min_n = &not_found;
   return min_n;
 }
 
@@ -410,6 +467,7 @@ static neighbor* addNeighbor(const rimeaddr_t* addr)
       rimeaddr_copy(&n->addr, addr);
       /* Place the neighbor on the neighbor list. */
       list_add(neighbors_list, n);
+      printf("new neighbor ID:%d added to neighbors list\n",addr->u8[0]);
     }
   }
   return n;
@@ -418,7 +476,7 @@ static neighbor* addNeighbor(const rimeaddr_t* addr)
 static neighbor* addChild(const rimeaddr_t* addr)
 {
   neighbor* n;
-  printf("adding neighbor with addr %d as child\n", addr->u8[0]);
+  // printf("adding neighbor with addr %d as child\n", addr->u8[0]);
   for(n = list_head(children_list); n != NULL; n = list_item_next(n)) {
     /* We break out of the loop if the address of the neighbor matches
        the address of the neighbor from which we received this
@@ -447,7 +505,7 @@ static neighbor* addChild(const rimeaddr_t* addr)
 }
 
 //clears the given list and deallocates all members' memory
-static void clearList(list_t* l)
+/*static void clearList(list_t* l)
 {
   neighbor* n;
   n = list_pop(*l);
@@ -455,51 +513,67 @@ static void clearList(list_t* l)
     memb_free(&neighbors_memb, n);
     n = list_pop(*l);
   }
-}
+  }*/
 
 //send mwoe result to our parent
 static void sendToParent(const neighbor* n, uint8_t type)
 {
-  struct unicast_message msg;
+  struct runicast_message msg;
   //  if( //check if our mwoe is our parent)
   msg.type = type;
   msg.mwoe_addr = n->addr;
   msg.mwoe_id = n->id;
   msg.mwoe_weight = n->weight;
   packetbuf_copyfrom(&msg, sizeof(msg));
-  unicast_send(&unicast, &parent);
+  runicast_send(&runicast, &parent, MAX_RETRANSMISSIONS);
 }
 /*---------------------------------------------------------------------------*/
 
 static void sendMergeNotify(const rimeaddr_t * addr){
-  struct unicast_message msg;
+  struct runicast_message msg;
   msg.type = UNICAST_TYPE_NOTIFY_MERGE;
-  printf("sending merge notify to %d\n",addr->u8[0]);
+  printf("sending merge notify to %d\n",mwoe_owner.u8[0]);
   //  rimeaddr_copy(&msg.mwoe_addr, &n->addr);  
   rimeaddr_copy(&msg.mwoe_addr, addr);  
   // msg.mwoe_id = n->id;
   // msg.mwoe_weight = n->weight;
   packetbuf_copyfrom(&msg, sizeof(msg));
-  unicast_send(&unicast, &mwoe_owner);
+  runicast_send(&runicast, &mwoe_owner, MAX_RETRANSMISSIONS);
 }
 
 static void sendMergeRequest(const rimeaddr_t* addr){
-  struct unicast_message msg;
+  struct runicast_message msg;
   printf("sending merge request to %d\n",addr->u8[0]);
   msg.type = UNICAST_TYPE_MERGE_REQUEST;
   packetbuf_copyfrom(&msg, sizeof(msg));
-  unicast_send(&unicast, addr);
+  runicast_send(&runicast, addr, MAX_RETRANSMISSIONS);
 }
 
 static void addChildMWOE(){
   neighbor* n;
-  n = addChild(&min_n->addr);
-  //if(n != NULL){}
-  n->weight = min_n->weight;
-  n->level = min_n->level; //not used
-  /* Print out a message. */
-  printf("New child connected to the fragment with ID:%d, num_children: %d \n",
-	 n->addr.u8[0],
-	 ++num_children);
-  list_remove(neighbors_list, min_n);
+  if(min_n != &not_found){
+    n = addChild(&min_n->addr);
+    //if(n != NULL){}
+    n->weight = min_n->weight;
+    n->level = min_n->level; //not used
+    /* Print out a message. */
+    printf("New child connected to the fragment with ID:%d and RSSI: %d, num_children: %d \n",
+	   n->addr.u8[0],
+	   n->weight,
+	   ++num_children);
+    list_remove(neighbors_list, min_n);
+    rimeaddr_copy(&last_added_mwoe_addr, &n->addr);
+    printf("neighbor ID:%d moved from neighbors list to child list\n",n->addr.u8[0]);
+  }
+}
+
+static void removeNeighbor(const rimeaddr_t * addr){
+  neighbor* n;
+  for(n = list_head(neighbors_list); n != NULL; n = list_item_next(n)) {
+    if(rimeaddr_cmp(&n->addr, addr)){
+      printf("neighbor ID:%d removed from neighbors list\n",addr->u8[0]);
+      list_remove(neighbors_list, n);
+      break;
+    }
+  }
 }
