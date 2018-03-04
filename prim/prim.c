@@ -4,7 +4,9 @@
 #include <stdbool.h>
  
 // Number of vertices in the graph
-#define V 8
+#define V 10
+
+
 
 PROCESS(prim_process, "Prim's algorithm");
 AUTOSTART_PROCESSES(&prim_process);
@@ -14,7 +16,7 @@ PROCESS_THREAD(prim_process, ev, data) {
 PROCESS_BEGIN();
 
 	//Adjacency matrix of the undirected graph
-   int graph[V][V] = {{0, 6, 12, 0, 0, 0, 0, 0},
+   //int graph[V][V] = {{0, 6, 12, 0, 0, 0, 0, 0},
                       {6, 0, 5, 0, 14, 0, 0, 8},
                       {12, 5, 0, 9, 0, 7, 0, 0},
                       {0, 0, 9, 0, 0, 0, 0, 0},
